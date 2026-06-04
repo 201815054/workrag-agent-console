@@ -1,4 +1,5 @@
 const STORAGE_KEY = "workrag-agent-state-v1";
+const AUTH_KEY = "workrag-agent-auth-v1";
 const API_BASE =
   window.WORKRAG_API_BASE ||
   (["localhost", "127.0.0.1", ""].includes(window.location.hostname)
@@ -93,6 +94,8 @@ let activeWorkflow = "summary";
 let latestAgentOutput = "";
 let apiOnline = false;
 let aiOnline = false;
+let currentUser = null;
+let activeSessionId = null;
 
 const els = {
   navItems: document.querySelectorAll(".nav-item"),
@@ -108,6 +111,18 @@ const els = {
   addManualBtn: document.querySelector("#addManualBtn"),
   loadDemoBtn: document.querySelector("#loadDemoBtn"),
   resetBtn: document.querySelector("#resetBtn"),
+  roleBadge: document.querySelector("#roleBadge"),
+  loginForm: document.querySelector("#loginForm"),
+  loginEmail: document.querySelector("#loginEmail"),
+  loginPassword: document.querySelector("#loginPassword"),
+  logoutBtn: document.querySelector("#logoutBtn"),
+  adminDemoBtn: document.querySelector("#adminDemoBtn"),
+  userDemoBtn: document.querySelector("#userDemoBtn"),
+  demoLoginActions: document.querySelector("#demoLoginActions"),
+  currentUserBox: document.querySelector("#currentUserBox"),
+  sessionList: document.querySelector("#sessionList"),
+  newSessionBtn: document.querySelector("#newSessionBtn"),
+  manualVisibility: document.querySelector("#manualVisibility"),
   chatMessages: document.querySelector("#chatMessages"),
   chatForm: document.querySelector("#chatForm"),
   questionInput: document.querySelector("#questionInput"),
@@ -127,6 +142,11 @@ const els = {
   chunkCountBadge: document.querySelector("#chunkCountBadge"),
   exportBtn: document.querySelector("#exportBtn"),
   apiModeBadge: document.querySelector("#apiModeBadge"),
+  accessAdminPanel: document.querySelector("#accessAdminPanel"),
+  userTable: document.querySelector("#userTable"),
+  permissionDocumentSelect: document.querySelector("#permissionDocumentSelect"),
+  permissionUserSelect: document.querySelector("#permissionUserSelect"),
+  grantAccessBtn: document.querySelector("#grantAccessBtn"),
   emptyTemplate: document.querySelector("#emptyStateTemplate"),
 };
 
@@ -136,16 +156,9 @@ async function boot() {
   bindEvents();
   renderWorkflows();
   apiOnline = await checkApi();
+  if (apiOnline) await restoreAuth();
   await syncFromApi();
-  if (state.chat.length === 0) {
-    state.chat.push({
-      role: "assistant",
-      content:
-        "문서를 업로드하거나 데모 문서를 불러온 뒤 질문하세요. 답변에는 검색된 문서 출처와 신뢰도 점수가 함께 표시됩니다.",
-      createdAt: new Date().toISOString(),
-      citations: [],
-    });
-  }
+  ensureWelcomeMessage();
   renderAll();
 }
 
@@ -181,7 +194,7 @@ function bindEvents() {
     const title = els.manualTitle.value.trim() || "직접 입력 문서";
     const text = els.manualText.value.trim();
     if (!text) return;
-    await addDocument({ name: title, type: "manual/text", text });
+    await addDocument({ name: title, type: "manual/text", text, visibility: els.manualVisibility.value });
     els.manualTitle.value = "";
     els.manualText.value = "";
   });
@@ -196,6 +209,10 @@ function bindEvents() {
     const confirmed = window.confirm("문서, 질문 로그, Agent 실행 이력을 모두 삭제할까요?");
     if (!confirmed) return;
     if (apiOnline) {
+      if (currentUser?.role !== "admin") {
+        window.alert("전체 초기화는 관리자만 사용할 수 있습니다.");
+        return;
+      }
       await apiFetch("/reset", { method: "DELETE" });
     }
     state = createEmptyState();
@@ -216,6 +233,15 @@ function bindEvents() {
   els.runAgentBtn.addEventListener("click", runAgent);
   els.copyAgentBtn.addEventListener("click", copyAgentOutput);
   els.exportBtn.addEventListener("click", exportLogs);
+  els.loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await login(els.loginEmail.value, els.loginPassword.value);
+  });
+  els.adminDemoBtn.addEventListener("click", () => login("admin@workrag.demo", "admin1234"));
+  els.userDemoBtn.addEventListener("click", () => login("user@workrag.demo", "user1234"));
+  els.logoutBtn.addEventListener("click", logout);
+  els.newSessionBtn.addEventListener("click", createNewSession);
+  els.grantAccessBtn.addEventListener("click", grantDocumentAccess);
 }
 
 function switchView(view) {
@@ -227,6 +253,7 @@ function switchView(view) {
 }
 
 async function ingestFiles(files) {
+  if (apiOnline && !requireLoggedIn()) return;
   for (const file of files) {
     if (apiOnline) {
       const form = new FormData();
@@ -286,6 +313,7 @@ async function addDocument(input) {
   if (!cleanText) return;
 
   if (apiOnline) {
+    if (!requireLoggedIn()) return;
     await apiFetch("/documents/manual", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -293,6 +321,7 @@ async function addDocument(input) {
         name: input.name,
         type: input.type || "manual/text",
         text: cleanText,
+        visibility: input.visibility || "team",
       }),
     });
     await syncFromApi();
@@ -344,13 +373,15 @@ function chunkDocument(doc) {
 
 async function askQuestion(question) {
   if (apiOnline) {
+    if (!requireLoggedIn()) return;
     state.chat.push({ role: "user", content: question, createdAt: new Date().toISOString() });
     try {
       const response = await apiFetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, session_id: activeSessionId }),
       });
+      activeSessionId = response.sessionId || activeSessionId;
       state.chat.push({
         role: "assistant",
         content: response.answer,
@@ -487,6 +518,7 @@ function bestSentences(text, queryTokens, limit) {
 async function runAgent() {
   const command = els.agentCommand.value.trim() || defaultAgentCommand(activeWorkflow);
   if (apiOnline) {
+    if (!requireLoggedIn()) return;
     const response = await apiFetch("/agent/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -653,6 +685,8 @@ function exportLogs() {
 }
 
 function renderAll() {
+  renderAuth();
+  renderSessions();
   renderChat();
   renderCounts();
   renderAdmin();
@@ -736,6 +770,8 @@ function renderAdmin() {
   renderDocuments();
   renderLogs();
   renderKeywords();
+  renderUsers();
+  renderPermissionControls();
 }
 
 function renderDocuments() {
@@ -748,8 +784,26 @@ function renderDocuments() {
   state.documents.forEach((doc) => {
     const row = document.createElement("article");
     row.className = "doc-row";
-    row.innerHTML = `<div class="doc-row-header"><strong>${escapeHtml(doc.name)}</strong><button class="icon-button" title="삭제" type="button">×</button></div><small>${doc.type} · ${formatBytes(doc.size)} · ${getChunkCount(doc)} chunks · ${formatDate(doc.uploadedAt)}</small>`;
-    row.querySelector("button").addEventListener("click", async () => {
+    const canAdminDoc = currentUser?.role === "admin" || doc.ownerId === currentUser?.id;
+    row.innerHTML = `<div class="doc-row-header"><strong>${escapeHtml(doc.name)}</strong>${canAdminDoc ? '<button class="icon-button" title="삭제" type="button">×</button>' : ""}</div><small>${doc.type} · ${formatBytes(doc.size)} · ${getChunkCount(doc)} chunks · ${doc.visibility || "team"} · ${formatDate(doc.uploadedAt)}</small>`;
+    if (canAdminDoc) {
+      const actions = document.createElement("div");
+      actions.className = "doc-meta-actions";
+      actions.innerHTML = `<select aria-label="공개 범위"><option value="team">팀 전체 공개</option><option value="private">나만/허용 사용자</option></select><span class="status-pill muted">owner</span>`;
+      const select = actions.querySelector("select");
+      select.value = doc.visibility || "team";
+      select.addEventListener("change", async () => {
+        await apiFetch(`/documents/${doc.id}/visibility`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ visibility: select.value }),
+        });
+        await syncFromApi();
+        renderAll();
+      });
+      row.append(actions);
+    }
+    row.querySelector("button")?.addEventListener("click", async () => {
       if (apiOnline) {
         await apiFetch(`/documents/${doc.id}`, { method: "DELETE" });
         await syncFromApi();
@@ -761,6 +815,38 @@ function renderDocuments() {
     });
     els.documentTable.append(row);
   });
+}
+
+function renderUsers() {
+  els.accessAdminPanel.classList.toggle("hidden", currentUser?.role !== "admin");
+  els.userTable.innerHTML = "";
+  if (currentUser?.role !== "admin") return;
+  state.users.forEach((user) => {
+    const row = document.createElement("article");
+    row.className = "doc-row";
+    row.innerHTML = `<strong>${escapeHtml(user.name)}</strong><small>${escapeHtml(user.email)} · ${user.role} · ${formatDate(user.createdAt)}</small>`;
+    els.userTable.append(row);
+  });
+}
+
+function renderPermissionControls() {
+  if (currentUser?.role !== "admin") return;
+  els.permissionDocumentSelect.innerHTML = "";
+  els.permissionUserSelect.innerHTML = "";
+  state.documents.forEach((doc) => {
+    const option = document.createElement("option");
+    option.value = doc.id;
+    option.textContent = doc.name;
+    els.permissionDocumentSelect.append(option);
+  });
+  state.users
+    .filter((user) => user.role !== "admin")
+    .forEach((user) => {
+      const option = document.createElement("option");
+      option.value = user.id;
+      option.textContent = `${user.name} (${user.email})`;
+      els.permissionUserSelect.append(option);
+    });
 }
 
 function renderLogs() {
@@ -877,27 +963,187 @@ async function checkApi() {
 }
 
 async function syncFromApi(options = {}) {
-  if (!apiOnline) return;
-  const apiState = await apiFetch("/state");
+  if (!apiOnline || !getToken()) return;
+  let apiState;
+  try {
+    apiState = await apiFetch("/state");
+  } catch (error) {
+    if (String(error.message).includes("401")) logout(false);
+    return;
+  }
   const chat = state.chat;
   state = {
     ...createEmptyState(),
+    currentUser: apiState.currentUser || null,
     documents: apiState.documents || [],
     queryLogs: (apiState.queryLogs || []).map(normalizeQueryLog),
     automationLogs: (apiState.automationLogs || []).map(normalizeAutomationLog),
+    sessions: apiState.sessions || [],
+    users: apiState.users || [],
     keywords: apiState.keywords || [],
     chat,
   };
+  currentUser = apiState.currentUser || currentUser;
   persist();
 }
 
 async function apiFetch(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, options);
+  const headers = new Headers(options.headers || {});
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `API request failed: ${response.status}`);
+    throw new Error(`API request failed: ${response.status} ${text}`);
   }
   return response.json();
+}
+
+async function restoreAuth() {
+  const saved = loadAuth();
+  if (!saved?.token) return;
+  try {
+    const response = await apiFetch("/auth/me");
+    currentUser = response.user;
+  } catch {
+    clearAuth();
+    currentUser = null;
+  }
+}
+
+async function login(email, password) {
+  if (!apiOnline) {
+    window.alert("서버 모드에서만 로그인을 사용할 수 있습니다.");
+    return;
+  }
+  const response = await apiFetch("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  saveAuth(response.token);
+  currentUser = response.user;
+  state.chat = [];
+  activeSessionId = null;
+  await syncFromApi();
+  ensureWelcomeMessage();
+  renderAll();
+}
+
+function logout(render = true) {
+  clearAuth();
+  currentUser = null;
+  activeSessionId = null;
+  state = createEmptyState();
+  ensureWelcomeMessage();
+  if (render) renderAll();
+}
+
+async function createNewSession() {
+  if (!apiOnline || !currentUser) {
+    activeSessionId = null;
+    state.chat = [];
+    ensureWelcomeMessage();
+    renderAll();
+    return;
+  }
+  const response = await apiFetch("/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "새 대화" }),
+  });
+  activeSessionId = response.session.id;
+  state.chat = [];
+  ensureWelcomeMessage();
+  await syncFromApi();
+  renderAll();
+}
+
+async function loadSession(sessionId) {
+  activeSessionId = sessionId;
+  const response = await apiFetch(`/sessions/${sessionId}/messages`);
+  state.chat = response.messages.map((message) => ({
+    role: message.role,
+    content: message.content,
+    citations: message.citations || [],
+    confidence: message.confidence,
+    mode: message.mode,
+    createdAt: message.createdAt,
+  }));
+  ensureWelcomeMessage();
+  renderAll();
+}
+
+async function grantDocumentAccess() {
+  const documentId = els.permissionDocumentSelect.value;
+  const userId = els.permissionUserSelect.value;
+  if (!documentId || !userId) return;
+  await apiFetch(`/documents/${documentId}/access`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, permission: "read" }),
+  });
+  await syncFromApi();
+  renderAll();
+}
+
+function renderAuth() {
+  const isLoggedIn = Boolean(currentUser);
+  els.loginForm.classList.toggle("hidden", !apiOnline || isLoggedIn);
+  els.demoLoginActions.classList.toggle("hidden", !apiOnline || isLoggedIn);
+  els.logoutBtn.classList.toggle("hidden", !isLoggedIn);
+  els.currentUserBox.classList.toggle("hidden", !isLoggedIn);
+  els.currentUserBox.innerHTML = isLoggedIn
+    ? `<strong>${escapeHtml(currentUser.name)}</strong><small>${escapeHtml(currentUser.email)} · ${currentUser.role}</small>`
+    : "";
+  els.roleBadge.textContent = isLoggedIn ? `${currentUser.role}` : "Guest";
+  els.resetBtn.classList.toggle("hidden", apiOnline && currentUser?.role !== "admin");
+}
+
+function requireLoggedIn() {
+  if (currentUser) return true;
+  window.alert("데모 계정으로 로그인한 뒤 사용할 수 있습니다.");
+  return false;
+}
+
+function renderSessions() {
+  els.sessionList.innerHTML = "";
+  if (!apiOnline || !currentUser) {
+    els.sessionList.append(renderEmptyState("로그인이 필요합니다.", "대화방 히스토리는 서버 모드에서 저장됩니다."));
+    return;
+  }
+  if (!state.sessions?.length) {
+    els.sessionList.append(renderEmptyState("대화방이 없습니다.", "질문하면 자동으로 대화방이 생성됩니다."));
+    return;
+  }
+  state.sessions.forEach((session) => {
+    const item = document.createElement("button");
+    item.className = `session-item ${session.id === activeSessionId ? "active" : ""}`;
+    item.type = "button";
+    item.innerHTML = `<strong>${escapeHtml(session.title)}</strong><small>${formatDate(session.updatedAt)}</small>`;
+    item.addEventListener("click", () => loadSession(session.id));
+    els.sessionList.append(item);
+  });
+}
+
+function saveAuth(token) {
+  localStorage.setItem(AUTH_KEY, JSON.stringify({ token }));
+}
+
+function loadAuth() {
+  try {
+    return JSON.parse(localStorage.getItem(AUTH_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function clearAuth() {
+  localStorage.removeItem(AUTH_KEY);
+}
+
+function getToken() {
+  return loadAuth()?.token || "";
 }
 
 function ensureWelcomeMessage() {
@@ -965,10 +1211,14 @@ function loadState() {
     if (!raw) return createEmptyState();
     const parsed = JSON.parse(raw);
     return {
+      currentUser: parsed.currentUser || null,
       documents: parsed.documents || [],
       chat: parsed.chat || [],
       queryLogs: parsed.queryLogs || [],
       automationLogs: parsed.automationLogs || [],
+      sessions: parsed.sessions || [],
+      users: parsed.users || [],
+      keywords: parsed.keywords || [],
     };
   } catch {
     return createEmptyState();
@@ -976,11 +1226,14 @@ function loadState() {
 }
 
 function createEmptyState() {
-    return {
-      documents: [],
-      chat: [],
-      queryLogs: [],
-      automationLogs: [],
-      keywords: [],
-    };
+  return {
+    currentUser: null,
+    documents: [],
+    chat: [],
+    queryLogs: [],
+    automationLogs: [],
+    sessions: [],
+    users: [],
+    keywords: [],
+  };
 }

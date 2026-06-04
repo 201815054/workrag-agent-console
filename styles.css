@@ -300,6 +300,7 @@ label {
 }
 
 input,
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--line);
@@ -314,6 +315,11 @@ input {
   padding: 0 12px;
 }
 
+select {
+  min-height: 44px;
+  padding: 0 12px;
+}
+
 textarea {
   resize: vertical;
   min-height: 110px;
@@ -322,6 +328,7 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(14, 124, 123, 0.12);
@@ -330,7 +337,9 @@ textarea:focus {
 .primary-button,
 .ghost-button,
 .danger-button,
-.icon-button {
+.icon-button,
+.mini-button,
+.ghost-dark-button {
   min-height: 40px;
   border-radius: 8px;
   border: 1px solid transparent;
@@ -361,6 +370,98 @@ textarea:focus {
   border-color: #f3c3bd;
   background: #fff5f3;
   color: var(--red);
+}
+
+.mini-button {
+  min-height: 30px;
+  padding: 0 9px;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08);
+  color: #f8fafc;
+  font-size: 12px;
+}
+
+.ghost-dark-button {
+  width: 100%;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f8fafc;
+}
+
+.auth-panel,
+.session-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.auth-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.login-form,
+.demo-login-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.login-form input {
+  min-height: 38px;
+  border-color: rgba(255, 255, 255, 0.16);
+  background: #202b33;
+  color: #f8fafc;
+}
+
+.login-form input::placeholder {
+  color: #9caab4;
+}
+
+.current-user {
+  display: grid;
+  gap: 4px;
+  color: #f8fafc;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.current-user small,
+.session-item small {
+  color: #b9c4cc;
+}
+
+.session-list {
+  display: grid;
+  gap: 6px;
+  max-height: 176px;
+  overflow: auto;
+}
+
+.session-item {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #f8fafc;
+  text-align: left;
+}
+
+.session-item.active,
+.session-item:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.hidden {
+  display: none !important;
 }
 
 .chat-panel {
@@ -567,6 +668,26 @@ textarea:focus {
   line-height: 1.4;
 }
 
+.doc-meta-actions,
+.access-form {
+  display: grid;
+  gap: 8px;
+}
+
+.doc-meta-actions {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.doc-meta-actions select {
+  min-height: 34px;
+}
+
+.access-form {
+  padding: 0 18px 18px;
+}
+
 .icon-button {
   width: 34px;
   min-height: 34px;
@@ -633,6 +754,11 @@ textarea:focus {
 
   .sidebar-panel {
     display: none;
+  }
+
+  .auth-panel,
+  .session-panel {
+    min-width: 220px;
   }
 
   .main-grid,

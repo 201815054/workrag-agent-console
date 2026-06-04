@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -12,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +30,8 @@ DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "workrag.sqlite3"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+JWT_SECRET = os.getenv("JWT_SECRET", "workrag-demo-secret")
+TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7
 
 STOPWORDS = {
     "그리고",
@@ -59,15 +66,41 @@ class ManualDocument(BaseModel):
     name: str
     text: str
     type: str = "manual/text"
+    visibility: str = "team"
 
 
 class ChatRequest(BaseModel):
     question: str
+    session_id: str | None = None
 
 
 class AgentRequest(BaseModel):
     workflow: str = "summary"
     command: str
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class SessionRequest(BaseModel):
+    title: str = "새 대화"
+
+
+class DocumentAccessRequest(BaseModel):
+    user_id: str
+    permission: str = "read"
+
+
+class DocumentVisibilityRequest(BaseModel):
+    visibility: str
 
 
 app = FastAPI(title="WorkRAG Agent API", version="0.1.0")
@@ -81,6 +114,23 @@ app.add_middleware(
 )
 
 app.mount("/portfolio-assets", StaticFiles(directory=ROOT_DIR / "portfolio-assets"), name="portfolio-assets")
+
+
+def get_current_user(authorization: str | None = Header(default=None)) -> sqlite3.Row:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="authentication required")
+    payload = decode_token(authorization.removeprefix("Bearer ").strip())
+    with db() as conn:
+        user = conn.execute("select * from users where id = ?", (payload.get("sub"),)).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="user not found")
+    return user
+
+
+def require_admin(current_user: sqlite3.Row = Depends(get_current_user)) -> sqlite3.Row:
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="admin permission required")
+    return current_user
 
 
 @app.on_event("startup")
@@ -98,61 +148,129 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.post("/api/auth/register")
+def register(payload: RegisterRequest) -> dict[str, Any]:
+    email = payload.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="valid email is required")
+    if len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="password must be at least 6 characters")
+    with db() as conn:
+        existing = conn.execute("select id from users where email = ?", (email,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="email already exists")
+        user_count = conn.execute("select count(*) as count from users").fetchone()["count"]
+        role = "admin" if user_count == 0 else "user"
+        user_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            insert into users (id, email, name, password_hash, role, created_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, email, payload.name.strip() or email, hash_password(payload.password), role, now_iso()),
+        )
+        conn.commit()
+        user = conn.execute("select * from users where id = ?", (user_id,)).fetchone()
+    return {"user": serialize_user(user), "token": create_token(user_id)}
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest) -> dict[str, Any]:
+    with db() as conn:
+        user = conn.execute("select * from users where email = ?", (payload.email.strip().lower(),)).fetchone()
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    return {"user": serialize_user(user), "token": create_token(user["id"])}
+
+
+@app.get("/api/auth/me")
+def me(current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    return {"user": serialize_user(current_user)}
+
+
 @app.get("/api/state")
-def get_state() -> dict[str, Any]:
+def get_state(current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     with db() as conn:
         documents = [
             serialize_document(row, chunk_count=get_chunk_count(conn, row["id"]))
-            for row in conn.execute("select * from documents order by uploaded_at desc")
+            for row in list_accessible_documents(conn, current_user)
         ]
         query_logs = [
             dict(row)
-            for row in conn.execute("select * from query_logs order by created_at desc limit 50")
+            for row in list_query_logs(conn, current_user)
         ]
         automation_logs = [
             dict(row)
-            for row in conn.execute("select * from automation_logs order by created_at desc limit 50")
+            for row in list_automation_logs(conn, current_user)
         ]
         chunks = [
             dict(row)
+            for row in list_accessible_chunks(conn, current_user)
+        ]
+        users = [
+            serialize_user(row)
+            for row in conn.execute("select * from users order by created_at asc")
+        ] if current_user["role"] == "admin" else []
+        sessions = [
+            serialize_session(row)
             for row in conn.execute(
-                "select id, document_id, doc_name, chunk_index, text from chunks order by created_at desc"
+                "select * from chat_sessions where user_id = ? order by updated_at desc",
+                (current_user["id"],),
             )
         ]
 
     return {
+        "currentUser": serialize_user(current_user),
         "documents": documents,
         "queryLogs": query_logs,
         "automationLogs": automation_logs,
+        "sessions": sessions,
+        "users": users,
         "keywords": top_keywords(" ".join(chunk["text"] for chunk in chunks), 18),
         "metrics": build_metrics(documents, query_logs),
     }
 
 
 @app.post("/api/documents/manual")
-def create_manual_document(payload: ManualDocument) -> dict[str, Any]:
+def create_manual_document(payload: ManualDocument, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     text = normalize_whitespace(payload.text)
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
-    document = save_document(payload.name.strip() or "직접 입력 문서", payload.type, text.encode("utf-8"), text)
+    document = save_document(
+        payload.name.strip() or "직접 입력 문서",
+        payload.type,
+        text.encode("utf-8"),
+        text,
+        current_user,
+        payload.visibility,
+    )
     return {"document": document}
 
 
 @app.post("/api/documents/upload")
-async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_document(file: UploadFile = File(...), current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     content = await file.read()
     text = extract_file_text(file.filename or "uploaded-file", content)
-    document = save_document(file.filename or "uploaded-file", file.content_type or infer_type(file.filename), content, text)
+    document = save_document(
+        file.filename or "uploaded-file",
+        file.content_type or infer_type(file.filename),
+        content,
+        text,
+        current_user,
+        "team",
+    )
     return {"document": document}
 
 
 @app.delete("/api/documents/{document_id}")
-def delete_document(document_id: str) -> dict[str, Any]:
+def delete_document(document_id: str, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     with db() as conn:
         row = conn.execute("select storage_path from documents where id = ?", (document_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="document not found")
+        require_document_admin(conn, document_id, current_user)
         conn.execute("delete from chunks where document_id = ?", (document_id,))
+        conn.execute("delete from document_permissions where document_id = ?", (document_id,))
         conn.execute("delete from documents where id = ?", (document_id,))
         conn.commit()
 
@@ -162,27 +280,141 @@ def delete_document(document_id: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.patch("/api/documents/{document_id}/visibility")
+def update_document_visibility(
+    document_id: str,
+    payload: DocumentVisibilityRequest,
+    current_user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, Any]:
+    if payload.visibility not in {"private", "team"}:
+        raise HTTPException(status_code=400, detail="visibility must be private or team")
+    with db() as conn:
+        require_document_admin(conn, document_id, current_user)
+        conn.execute("update documents set visibility = ? where id = ?", (payload.visibility, document_id))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/documents/{document_id}/access")
+def grant_document_access(
+    document_id: str,
+    payload: DocumentAccessRequest,
+    current_user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, Any]:
+    if payload.permission not in {"read", "write", "admin"}:
+        raise HTTPException(status_code=400, detail="invalid permission")
+    with db() as conn:
+        require_document_admin(conn, document_id, current_user)
+        user = conn.execute("select id from users where id = ?", (payload.user_id,)).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="user not found")
+        conn.execute(
+            """
+            insert into document_permissions (id, document_id, user_id, permission, created_at)
+            values (?, ?, ?, ?, ?)
+            on conflict(document_id, user_id) do update set permission = excluded.permission
+            """,
+            (str(uuid.uuid4()), document_id, payload.user_id, payload.permission, now_iso()),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/documents/{document_id}/access/{user_id}")
+def revoke_document_access(
+    document_id: str,
+    user_id: str,
+    current_user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, Any]:
+    with db() as conn:
+        require_document_admin(conn, document_id, current_user)
+        conn.execute("delete from document_permissions where document_id = ? and user_id = ?", (document_id, user_id))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/sessions")
+def create_session(payload: SessionRequest, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    session_id = str(uuid.uuid4())
+    now = now_iso()
+    with db() as conn:
+        conn.execute(
+            """
+            insert into chat_sessions (id, user_id, title, created_at, updated_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (session_id, current_user["id"], payload.title.strip() or "새 대화", now, now),
+        )
+        conn.commit()
+        row = conn.execute("select * from chat_sessions where id = ?", (session_id,)).fetchone()
+    return {"session": serialize_session(row)}
+
+
+@app.get("/api/sessions/{session_id}/messages")
+def get_session_messages(session_id: str, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    with db() as conn:
+        require_session_owner(conn, session_id, current_user)
+        rows = conn.execute(
+            "select * from chat_messages where session_id = ? order by created_at asc",
+            (session_id,),
+        ).fetchall()
+    return {"messages": [serialize_message(row) for row in rows]}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    with db() as conn:
+        require_session_owner(conn, session_id, current_user)
+        conn.execute("delete from chat_messages where session_id = ?", (session_id,))
+        conn.execute("delete from chat_sessions where id = ?", (session_id,))
+        conn.commit()
+    return {"ok": True}
+
+
 @app.post("/api/chat")
-def chat(payload: ChatRequest) -> dict[str, Any]:
+def chat(payload: ChatRequest, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
 
     with db() as conn:
-        doc_count = conn.execute("select count(*) as count from documents").fetchone()["count"]
-        results = search_chunks(conn, question, 4)
+        session_id = ensure_chat_session(conn, current_user, payload.session_id, question)
+        doc_count = len(list_accessible_documents(conn, current_user))
+        results = search_chunks(conn, question, 4, current_user)
         answer = compose_answer(question, results, doc_count)
         log_id = str(uuid.uuid4())
         conn.execute(
             """
-            insert into query_logs (id, question, confidence, hit_count, created_at)
-            values (?, ?, ?, ?, ?)
+            insert into query_logs (id, user_id, session_id, question, answer, confidence, hit_count, mode, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (log_id, question, answer["confidence"], len(results), now_iso()),
+            (
+                log_id,
+                current_user["id"],
+                session_id,
+                question,
+                answer["content"],
+                answer["confidence"],
+                len(results),
+                answer.get("mode", "keyword-fallback"),
+                now_iso(),
+            ),
+        )
+        insert_message(conn, session_id, current_user["id"], "user", question)
+        insert_message(
+            conn,
+            session_id,
+            current_user["id"],
+            "assistant",
+            answer["content"],
+            answer["citations"],
+            answer["confidence"],
+            answer.get("mode", "keyword-fallback"),
         )
         conn.commit()
 
     return {
+        "sessionId": session_id,
         "question": question,
         "answer": answer["content"],
         "confidence": answer["confidence"],
@@ -193,28 +425,23 @@ def chat(payload: ChatRequest) -> dict[str, Any]:
 
 
 @app.post("/api/agent/run")
-def run_agent(payload: AgentRequest) -> dict[str, Any]:
+def run_agent(payload: AgentRequest, current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     command = payload.command.strip()
     if not command:
         raise HTTPException(status_code=400, detail="command is required")
     workflow = payload.workflow if payload.workflow in WORKFLOW_TITLES else "summary"
 
     with db() as conn:
-        chunks = search_chunks(conn, command, 6)
+        chunks = search_chunks(conn, command, 6, current_user)
         if not chunks:
-            chunks = [
-                dict(row)
-                for row in conn.execute(
-                    "select * from chunks order by created_at desc limit 6"
-                )
-            ]
+            chunks = list_accessible_chunks(conn, current_user)[:6]
         output = build_agent_output(workflow, command, chunks)
         conn.execute(
             """
-            insert into automation_logs (id, workflow, command, output, created_at)
-            values (?, ?, ?, ?, ?)
+            insert into automation_logs (id, user_id, workflow, command, output, created_at)
+            values (?, ?, ?, ?, ?, ?)
             """,
-            (str(uuid.uuid4()), WORKFLOW_TITLES[workflow], command, output, now_iso()),
+            (str(uuid.uuid4()), current_user["id"], WORKFLOW_TITLES[workflow], command, output, now_iso()),
         )
         conn.commit()
 
@@ -222,10 +449,13 @@ def run_agent(payload: AgentRequest) -> dict[str, Any]:
 
 
 @app.delete("/api/reset")
-def reset() -> dict[str, Any]:
+def reset(current_user: sqlite3.Row = Depends(require_admin)) -> dict[str, Any]:
     with db() as conn:
         conn.execute("delete from automation_logs")
         conn.execute("delete from query_logs")
+        conn.execute("delete from chat_messages")
+        conn.execute("delete from chat_sessions")
+        conn.execute("delete from document_permissions")
         conn.execute("delete from chunks")
         conn.execute("delete from documents")
         conn.commit()
@@ -256,6 +486,15 @@ def init_db() -> None:
     with db() as conn:
         conn.executescript(
             """
+            create table if not exists users (
+                id text primary key,
+                email text not null unique,
+                name text not null,
+                password_hash text not null,
+                role text not null check(role in ('admin', 'user')),
+                created_at text not null
+            );
+
             create table if not exists documents (
                 id text primary key,
                 name text not null,
@@ -279,21 +518,71 @@ def init_db() -> None:
 
             create table if not exists query_logs (
                 id text primary key,
+                user_id text,
+                session_id text,
                 question text not null,
+                answer text,
                 confidence integer not null,
                 hit_count integer not null,
+                mode text,
                 created_at text not null
             );
 
             create table if not exists automation_logs (
                 id text primary key,
+                user_id text,
                 workflow text not null,
                 command text not null,
                 output text not null,
                 created_at text not null
             );
+
+            create table if not exists chat_sessions (
+                id text primary key,
+                user_id text not null,
+                title text not null,
+                created_at text not null,
+                updated_at text not null,
+                foreign key(user_id) references users(id)
+            );
+
+            create table if not exists chat_messages (
+                id text primary key,
+                session_id text not null,
+                user_id text not null,
+                role text not null check(role in ('user', 'assistant')),
+                content text not null,
+                citations text not null default '[]',
+                confidence integer,
+                mode text,
+                created_at text not null,
+                foreign key(session_id) references chat_sessions(id),
+                foreign key(user_id) references users(id)
+            );
+
+            create table if not exists document_permissions (
+                id text primary key,
+                document_id text not null,
+                user_id text not null,
+                permission text not null check(permission in ('read', 'write', 'admin')),
+                created_at text not null,
+                unique(document_id, user_id),
+                foreign key(document_id) references documents(id),
+                foreign key(user_id) references users(id)
+            );
             """
         )
+        add_column_if_missing(conn, "documents", "owner_id", "text")
+        add_column_if_missing(conn, "documents", "visibility", "text not null default 'team'")
+        add_column_if_missing(conn, "query_logs", "user_id", "text")
+        add_column_if_missing(conn, "query_logs", "session_id", "text")
+        add_column_if_missing(conn, "query_logs", "answer", "text")
+        add_column_if_missing(conn, "query_logs", "mode", "text")
+        add_column_if_missing(conn, "automation_logs", "user_id", "text")
+        seed_demo_users(conn)
+        admin = conn.execute("select id from users where role = 'admin' order by created_at asc limit 1").fetchone()
+        if admin:
+            conn.execute("update documents set owner_id = ? where owner_id is null", (admin["id"],))
         conn.commit()
 
 
@@ -307,11 +596,263 @@ def db():
         conn.close()
 
 
-def save_document(name: str, doc_type: str, content: bytes, text: str) -> dict[str, Any]:
+def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
+    if column not in columns:
+        conn.execute(f"alter table {table} add column {column} {definition}")
+
+
+def seed_demo_users(conn: sqlite3.Connection) -> None:
+    demo_users = [
+        ("admin@workrag.demo", "관리자", "admin", "admin1234"),
+        ("user@workrag.demo", "일반 사용자", "user", "user1234"),
+    ]
+    for email, name, role, password in demo_users:
+        existing = conn.execute("select id from users where email = ?", (email,)).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            """
+            insert into users (id, email, name, password_hash, role, created_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), email, name, hash_password(password), role, now_iso()),
+        )
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return f"pbkdf2_sha256${salt}${base64.urlsafe_b64encode(digest).decode('ascii')}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algorithm, salt, encoded = stored.split("$", 2)
+    except ValueError:
+        return False
+    if algorithm != "pbkdf2_sha256":
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return hmac.compare_digest(base64.urlsafe_b64encode(digest).decode("ascii"), encoded)
+
+
+def create_token(user_id: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"sub": user_id, "exp": int(time.time()) + TOKEN_TTL_SECONDS}
+    unsigned = f"{b64_json(header)}.{b64_json(payload)}"
+    signature = hmac.new(JWT_SECRET.encode("utf-8"), unsigned.encode("utf-8"), hashlib.sha256).digest()
+    return f"{unsigned}.{b64_bytes(signature)}"
+
+
+def decode_token(token: str) -> dict[str, Any]:
+    try:
+        header_b64, payload_b64, signature_b64 = token.split(".", 2)
+        unsigned = f"{header_b64}.{payload_b64}"
+        expected = b64_bytes(hmac.new(JWT_SECRET.encode("utf-8"), unsigned.encode("utf-8"), hashlib.sha256).digest())
+        if not hmac.compare_digest(signature_b64, expected):
+            raise ValueError("bad signature")
+        payload = json.loads(base64.urlsafe_b64decode(pad_b64(payload_b64)).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid token") from exc
+    if payload.get("exp", 0) < int(time.time()):
+        raise HTTPException(status_code=401, detail="token expired")
+    return payload
+
+
+def b64_json(value: dict[str, Any]) -> str:
+    return b64_bytes(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+
+
+def b64_bytes(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def pad_b64(value: str) -> bytes:
+    return (value + "=" * (-len(value) % 4)).encode("ascii")
+
+
+def get_current_user(authorization: str | None = Header(default=None)) -> sqlite3.Row:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="authentication required")
+    payload = decode_token(authorization.removeprefix("Bearer ").strip())
+    with db() as conn:
+        user = conn.execute("select * from users where id = ?", (payload.get("sub"),)).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="user not found")
+    return user
+
+
+def require_admin(current_user: sqlite3.Row = Depends(get_current_user)) -> sqlite3.Row:
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="admin permission required")
+    return current_user
+
+
+def serialize_user(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "name": row["name"],
+        "role": row["role"],
+        "createdAt": row["created_at"],
+    }
+
+
+def serialize_session(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "userId": row["user_id"],
+        "title": row["title"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def serialize_message(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "sessionId": row["session_id"],
+        "role": row["role"],
+        "content": row["content"],
+        "citations": json.loads(row["citations"] or "[]"),
+        "confidence": row["confidence"],
+        "mode": row["mode"],
+        "createdAt": row["created_at"],
+    }
+
+
+def list_accessible_documents(conn: sqlite3.Connection, current_user: sqlite3.Row) -> list[sqlite3.Row]:
+    if current_user["role"] == "admin":
+        return conn.execute("select * from documents order by uploaded_at desc").fetchall()
+    return conn.execute(
+        """
+        select distinct d.*
+        from documents d
+        left join document_permissions p on p.document_id = d.id and p.user_id = ?
+        where d.visibility = 'team' or d.owner_id = ? or p.permission in ('read', 'write', 'admin')
+        order by d.uploaded_at desc
+        """,
+        (current_user["id"], current_user["id"]),
+    ).fetchall()
+
+
+def list_accessible_chunks(conn: sqlite3.Connection, current_user: sqlite3.Row) -> list[dict[str, Any]]:
+    documents = list_accessible_documents(conn, current_user)
+    if not documents:
+        return []
+    ids = [row["id"] for row in documents]
+    placeholders = ",".join("?" for _ in ids)
+    return [
+        dict(row)
+        for row in conn.execute(
+            f"select * from chunks where document_id in ({placeholders}) order by created_at desc",
+            ids,
+        )
+    ]
+
+
+def list_query_logs(conn: sqlite3.Connection, current_user: sqlite3.Row) -> list[sqlite3.Row]:
+    if current_user["role"] == "admin":
+        return conn.execute("select * from query_logs order by created_at desc limit 50").fetchall()
+    return conn.execute(
+        "select * from query_logs where user_id = ? order by created_at desc limit 50",
+        (current_user["id"],),
+    ).fetchall()
+
+
+def list_automation_logs(conn: sqlite3.Connection, current_user: sqlite3.Row) -> list[sqlite3.Row]:
+    if current_user["role"] == "admin":
+        return conn.execute("select * from automation_logs order by created_at desc limit 50").fetchall()
+    return conn.execute(
+        "select * from automation_logs where user_id = ? order by created_at desc limit 50",
+        (current_user["id"],),
+    ).fetchall()
+
+
+def require_document_admin(conn: sqlite3.Connection, document_id: str, current_user: sqlite3.Row) -> None:
+    document = conn.execute("select * from documents where id = ?", (document_id,)).fetchone()
+    if not document:
+        raise HTTPException(status_code=404, detail="document not found")
+    if current_user["role"] == "admin" or document["owner_id"] == current_user["id"]:
+        return
+    permission = conn.execute(
+        "select permission from document_permissions where document_id = ? and user_id = ?",
+        (document_id, current_user["id"]),
+    ).fetchone()
+    if not permission or permission["permission"] != "admin":
+        raise HTTPException(status_code=403, detail="document admin permission required")
+
+
+def require_session_owner(conn: sqlite3.Connection, session_id: str, current_user: sqlite3.Row) -> None:
+    session = conn.execute("select * from chat_sessions where id = ?", (session_id,)).fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    if current_user["role"] != "admin" and session["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="session permission required")
+
+
+def ensure_chat_session(conn: sqlite3.Connection, current_user: sqlite3.Row, session_id: str | None, question: str) -> str:
+    now = now_iso()
+    if session_id:
+        require_session_owner(conn, session_id, current_user)
+        conn.execute("update chat_sessions set updated_at = ? where id = ?", (now, session_id))
+        return session_id
+    new_id = str(uuid.uuid4())
+    title = question[:36] or "새 대화"
+    conn.execute(
+        """
+        insert into chat_sessions (id, user_id, title, created_at, updated_at)
+        values (?, ?, ?, ?, ?)
+        """,
+        (new_id, current_user["id"], title, now, now),
+    )
+    return new_id
+
+
+def insert_message(
+    conn: sqlite3.Connection,
+    session_id: str,
+    user_id: str,
+    role: str,
+    content: str,
+    citations: list[dict[str, Any]] | None = None,
+    confidence: int | None = None,
+    mode: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into chat_messages (id, session_id, user_id, role, content, citations, confidence, mode, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            session_id,
+            user_id,
+            role,
+            content,
+            json.dumps(citations or [], ensure_ascii=False),
+            confidence,
+            mode,
+            now_iso(),
+        ),
+    )
+
+
+def save_document(
+    name: str,
+    doc_type: str,
+    content: bytes,
+    text: str,
+    current_user: sqlite3.Row,
+    visibility: str,
+) -> dict[str, Any]:
     doc_id = str(uuid.uuid4())
     clean_text = normalize_whitespace(text)
     if not clean_text:
         clean_text = f"{name}\n\n본문 텍스트를 추출하지 못했습니다. 실제 납품형에서는 OCR/문서 파서를 연결합니다."
+    if visibility not in {"private", "team"}:
+        visibility = "team"
     storage_path = UPLOAD_DIR / f"{doc_id}-{safe_filename(name)}"
     storage_path.write_bytes(content)
     chunks = chunk_document(doc_id, name, clean_text)
@@ -319,10 +860,20 @@ def save_document(name: str, doc_type: str, content: bytes, text: str) -> dict[s
     with db() as conn:
         conn.execute(
             """
-            insert into documents (id, name, type, size, text, storage_path, uploaded_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into documents (id, name, type, size, text, storage_path, uploaded_at, owner_id, visibility)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (doc_id, name, doc_type or "application/octet-stream", len(content), clean_text, str(storage_path), now_iso()),
+            (
+                doc_id,
+                name,
+                doc_type or "application/octet-stream",
+                len(content),
+                clean_text,
+                str(storage_path),
+                now_iso(),
+                current_user["id"],
+                visibility,
+            ),
         )
         conn.executemany(
             """
@@ -410,13 +961,14 @@ def chunk_document(doc_id: str, doc_name: str, text: str) -> list[dict[str, Any]
     ]
 
 
-def search_chunks(conn: sqlite3.Connection, query: str, limit: int) -> list[dict[str, Any]]:
+def search_chunks(conn: sqlite3.Connection, query: str, limit: int, current_user: sqlite3.Row | None = None) -> list[dict[str, Any]]:
     query_tokens = tokenize(query)
     if not query_tokens:
         return []
 
     scored = []
-    for row in conn.execute("select * from chunks"):
+    rows = list_accessible_chunks(conn, current_user) if current_user is not None else [dict(row) for row in conn.execute("select * from chunks")]
+    for row in rows:
         chunk = dict(row)
         tokens = json.loads(chunk["tokens"])
         token_counts = count_tokens(tokens)
@@ -720,6 +1272,8 @@ def serialize_document(row: sqlite3.Row, chunk_count: int) -> dict[str, Any]:
         "size": row["size"],
         "uploadedAt": row["uploaded_at"],
         "chunks": chunk_count,
+        "ownerId": row["owner_id"],
+        "visibility": row["visibility"],
     }
 
 
