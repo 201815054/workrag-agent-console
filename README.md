@@ -63,18 +63,6 @@ Render에 GitHub 저장소를 연결하면 FastAPI 서버가 프론트엔드와 
 - 서버 기반 문서 삭제 및 전체 초기화
 - 선택형 OpenAI Responses API 연동
 
-## 포트폴리오 이미지
-
-위시켓 업로드용 이미지는 `portfolio-assets/`에 생성합니다.
-
-```bash
-python3 scripts/generate_portfolio_images.py
-```
-
-- `portfolio-assets/cover-480.png`: 표지 이미지, 480x480px
-- `portfolio-assets/01-rag-chat.png`: 문서 검색 챗봇 상세 이미지
-- `portfolio-assets/02-agent-workflow.png`: 업무 자동화 Agent 상세 이미지
-- `portfolio-assets/03-admin-dashboard.png`: 관리자 대시보드 상세 이미지
 
 ## 실제 납품형 확장안
 
