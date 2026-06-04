@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WorkRAG Agent Console</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">W</div>
+          <div>
+            <strong>WorkRAG</strong>
+            <span>Agent Console</span>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="주요 메뉴">
+          <button class="nav-item active" data-view="chat" type="button">
+            <span aria-hidden="true">⌕</span>
+            문서 검색
+          </button>
+          <button class="nav-item" data-view="agent" type="button">
+            <span aria-hidden="true">⚙</span>
+            자동화 Agent
+          </button>
+          <button class="nav-item" data-view="admin" type="button">
+            <span aria-hidden="true">▦</span>
+            관리자
+          </button>
+        </nav>
+
+        <div class="sidebar-panel">
+          <span class="eyebrow">Demo Stack</span>
+          <p>RAG 검색, Agent 워크플로우, 관리자 로그를 한 프로젝트에서 시연합니다.</p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Portfolio MVP</p>
+            <h1>사내 문서 검색 챗봇 + 업무 자동화 Agent</h1>
+          </div>
+          <div class="topbar-actions">
+            <span id="apiModeBadge" class="status-pill muted">Local mode</span>
+            <button id="loadDemoBtn" class="ghost-button" type="button">데모 문서</button>
+            <button id="resetBtn" class="danger-button" type="button">초기화</button>
+          </div>
+        </header>
+
+        <section id="chatView" class="view active-view" aria-labelledby="chatTitle">
+          <div class="main-grid">
+            <section class="panel upload-panel" aria-labelledby="uploadTitle">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Knowledge Base</p>
+                  <h2 id="uploadTitle">문서 업로드</h2>
+                </div>
+                <span id="docCountBadge" class="status-pill">0 docs</span>
+              </div>
+
+              <label id="dropZone" class="drop-zone" for="fileInput">
+                <input id="fileInput" type="file" multiple accept=".txt,.md,.csv,.json,.html,.pdf,.xlsx,.xls,.docx" />
+                <span class="drop-icon" aria-hidden="true">⇪</span>
+                <strong>PDF, 엑셀, 텍스트 문서를 추가하세요</strong>
+                <small>TXT/CSV/MD/JSON/HTML은 원문 추출, PDF는 브라우저 내 best-effort 추출을 사용합니다.</small>
+              </label>
+
+              <div class="manual-ingest">
+                <label for="manualTitle">직접 입력</label>
+                <input id="manualTitle" type="text" placeholder="문서 제목 예: 상담 매뉴얼" />
+                <textarea id="manualText" rows="5" placeholder="문서 내용을 붙여넣으면 바로 검색 지식으로 색인됩니다."></textarea>
+                <button id="addManualBtn" class="primary-button" type="button">문서 색인</button>
+              </div>
+            </section>
+
+            <section class="panel chat-panel" aria-labelledby="chatTitle">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">RAG Chat</p>
+                  <h2 id="chatTitle">출처 기반 답변</h2>
+                </div>
+                <span id="confidenceBadge" class="status-pill muted">대기중</span>
+              </div>
+
+              <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
+
+              <form id="chatForm" class="chat-form">
+                <input id="questionInput" type="text" placeholder="예: 환불 규정과 처리 SLA를 알려줘" autocomplete="off" />
+                <button class="primary-button" type="submit">질문</button>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section id="agentView" class="view" aria-labelledby="agentTitle">
+          <section class="panel agent-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">LangGraph-style Workflow</p>
+                <h2 id="agentTitle">업무 자동화 Agent</h2>
+              </div>
+              <span id="agentStatus" class="status-pill">Ready</span>
+            </div>
+
+            <div class="agent-layout">
+              <div class="workflow-list" id="workflowList"></div>
+              <div class="agent-runner">
+                <label for="agentCommand">업무 요청</label>
+                <textarea id="agentCommand" rows="6" placeholder="예: 고객 상담 문서를 요약하고 메일 답변 초안을 만들어줘"></textarea>
+                <div class="runner-actions">
+                  <button id="runAgentBtn" class="primary-button" type="button">Agent 실행</button>
+                  <button id="copyAgentBtn" class="ghost-button" type="button">결과 복사</button>
+                </div>
+                <pre id="agentOutput" class="agent-output">실행 결과가 여기에 표시됩니다.</pre>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section id="adminView" class="view" aria-labelledby="adminTitle">
+          <div class="section-heading admin-heading">
+            <div>
+              <p class="eyebrow">Admin Dashboard</p>
+              <h2 id="adminTitle">운영 현황</h2>
+            </div>
+            <button id="exportBtn" class="ghost-button" type="button">로그 내보내기</button>
+          </div>
+
+          <div id="metricGrid" class="metric-grid"></div>
+
+          <div class="admin-grid">
+            <section class="panel">
+              <div class="section-heading compact">
+                <h3>문서 관리</h3>
+                <span id="chunkCountBadge" class="status-pill muted">0 chunks</span>
+              </div>
+              <div id="documentTable" class="document-table"></div>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading compact">
+                <h3>질문 로그</h3>
+                <span class="status-pill muted">최근 8개</span>
+              </div>
+              <div id="queryLog" class="log-list"></div>
+            </section>
+          </div>
+
+          <div class="admin-grid">
+            <section class="panel">
+              <div class="section-heading compact">
+                <h3>상위 키워드</h3>
+              </div>
+              <div id="keywordCloud" class="keyword-cloud"></div>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading compact">
+                <h3>Agent 실행 이력</h3>
+              </div>
+              <div id="automationLog" class="log-list"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="emptyStateTemplate">
+      <div class="empty-state">
+        <strong>색인된 문서가 없습니다.</strong>
+        <span>데모 문서를 불러오거나 실제 문서를 업로드하세요.</span>
+      </div>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>
